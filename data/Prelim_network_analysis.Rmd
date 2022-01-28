@@ -1,0 +1,285 @@
+---
+title: "Preliminary Network Analysis"
+author: "Jiaxin Hu"
+date: "1/26/2022"
+output: html_document
+---
+
+## 1. Introduction
+
+This file implement a preliminary network analysis on the expression data in "MergedTagseqQTL.csv". The goal of the analysis is to **identify the QTLmarkers which have significant effects to the expression networks**.
+
+Specifically, the dataset include the expression data on $p = 25845$ genes of $n = 351$ observations with $m = 234$ QTLmarkers. For the $i$-th QTLmarker where $i = 1,...,m$, there are three possible genotypes "A","B" , and "H" with corresponding expression networks $N_{iA}, N_{iB}, N_{iH} \in \mathbb{R}^{p \times p}$. We detect whether there are significant differences among these three networks $N_{iA}, N_{iB}, N_{iH}$. 
+
+We apply the **sparse-Leading-Eigenvalue-Driven (sLED)** test in [Zhu et al 2017](https://projecteuclid.org/journals/annals-of-applied-statistics/volume-11/issue-3/Testing-high-dimensional-covariance-matrices-with-application-to-detecting-schizophrenia/10.1214/17-AOAS1062.full)  for the following hypothesis tests:
+$$(T_1) \quad H_0: N_{iA} =   N_{iB} \quad \leftrightarrow \quad H_1: N_{iA} \neq  N_{iB}$$
+$$(T_2) \quad H_0: N_{iA} =   N_{iH} \quad \leftrightarrow \quad H_1: N_{iA} \neq  N_{iH}$$
+$$(T_3) \quad H_0: N_{iB} =   N_{iH} \quad \leftrightarrow \quad H_1: N_{iB} \neq  N_{iH}$$
+for all $i = 1,...,m$. 
+
+## 2. Setup
+
+### Load packages
+
+The package for sLED is avaliable at https://github.com/lingxuez/sLED.
+
+```{r warning=FALSE, message=FALSE, results=FALSE}
+# load package 
+
+library(data.table)# fread
+library(sLED) #sLED
+
+# sLED installation
+# library(devtools)
+# devtools::install_github("lingxuez/sLED")
+
+library(ggplot2) # for visualization
+library(igraph) # for network visualization
+```
+
+### Load data and Preprocessing
+
+Here, we only consider the subset of the expression data with the locus whose cumulative values $> 250000$ due to the computational feasibility of local PC. More sophiscated preprocessing procedures should be applied here. 
+
+```{r}
+# load data
+dat = as.data.frame(fread("MergedTagseqQTL.csv"))
+
+qtlmarker <- dat[, 113:346] # genotype of each QTLmarker
+tagseq <- dat[,441:(ncol(dat)-2)] # expression data 
+
+# Trim out rare gene reads
+meanreads <- colSums(tagseq, na.rm = T)
+# 250000 is just a random number to make the code computationally feasible on local PC
+tagseq<- tagseq[, meanreads > 250000]   
+sum(meanreads > 250000)
+```
+
+## 3. Analysis: Detecting significant QTLmarkers
+
+### Analysis
+
+Here we perform the test for the first $m0 = 20$ QTLmarkers for demonstration. 
+
+Sparsity level is the key tuning parameter  the sLED test. A smaller sparsity level leads to a smaller number of top genes. Permutation time is another tuning parameter. More permutations lead to a more accurate test result but require more computational resources. 
+
+We consider 4 possible sparsity level $0.1, 0.2, 0.3, 0.5$ and 50 times of permutations here. The following chuck of codes needs about 15 mins. 
+
+```{r message = FALSE, results = FALSE}
+s_seq = c(0.1, 0.2, 0.3, 0.5) # sparsity level
+m0 = 20
+record <- as.data.frame(matrix(nrow = m0, ncol = 10))
+
+for (i in 1:m0) {
+
+  cat("qtlmarker = ",i, "\n")
+
+  markergeno <- qtlmarker[,i]
+
+  # Subdivide expression data by genotype
+  tagseq_aa <- tagseq[markergeno == "A",]
+  tagseq_ab <- tagseq[markergeno == "H",]
+  tagseq_bb <- tagseq[markergeno == "B",]
+
+  # no need to calculate covariance matrices
+  sLED_ab = sLED(tagseq_aa, tagseq_bb, sumabs.seq = s_seq, npermute = 50, seeds = 1:50) # T1
+  sLED_ah = sLED(tagseq_aa, tagseq_ab, sumabs.seq = s_seq, npermute = 50, seeds = 1:50) # T2
+  sLED_bh = sLED(tagseq_bb, tagseq_ab, sumabs.seq = s_seq, npermute = 50, seeds = 1:50) # T3
+
+  # record p value, output sparsity, and the optimal sparisty level
+  record[i,] = c(names(qtlmarker)[i],
+                 min(sLED_ab$pVal), sum(sLED_ab$leverage[which.min(sLED_ab$pVal),] > 1e-6), s_seq[which.min(sLED_ab$pVal)],
+                 min(sLED_ah$pVal), sum(sLED_ah$leverage[which.min(sLED_ah$pVal),] > 1e-6), s_seq[which.min(sLED_ah$pVal)],
+                 min(sLED_bh$pVal), sum(sLED_bh$leverage[which.min(sLED_bh$pVal),] > 1e-6), s_seq[which.min(sLED_bh$pVal)])
+}
+
+colnames(record) = c("qtlmarker","ABp", "ABtop", "ABs", "AHp", "AHtop", "AHs","BHp", "BHtop", "BHs")
+record[, 2:10] = apply(record[,2:10], 2, function(x) as.numeric(x))
+```
+
+```{r}
+record
+```
+
+### Visualization
+
+Here we visualize the test result of $T_1, T_2$, and $T_3$ for all QTLmarkers. 
+
+The QTLmarkers with test p value $< 0.05$ are statistically believed to have significant effect to the expression networks. For example, QTLmarker X20 has p value $= 0$ for the $T_1$ (A vs B) test. Then, we believe there are significant differences between the expression networks when QTLmarker X20 changes from genotype "A" to "B". 
+
+```{r}
+#obtain significance
+record$ABp_b = record$ABp < 0.05
+record$AHp_b = record$AHp < 0.05
+record$BHp_b = record$BHp < 0.05
+```
+
+Following figures visualize the p value results for $T_1, T_2,T_3$, respectively. The QTLmarkers with p value $< 0.05$ are red. The blue dashed line corresponds to the critical value p value $= 0.05$.
+
+```{r}
+# pvalue for T1 (A vs B)
+pv_ab = ggplot(data = record, aes(x = qtlmarker, y = ABp)) +
+  geom_point(aes(size = ABp_b, color = ABp_b))+
+  geom_hline(yintercept=0.05, linetype="dashed", color = "#61A2DA", lwd = 1.25)+
+  scale_color_manual(values=c("#999999", "#D75725"), name = "Significant", labels = c("no","yes") )+
+  scale_size_manual(values=c(2,3),name = "Significant", labels = c("no","yes"))+
+  labs(title = "T1 (A vs B)", x = "QTLmarker", y = "p value") +
+  theme_light()+
+  theme(axis.text.x = element_text(angle = 270, vjust = 0.5, hjust=1))
+pv_ab
+
+
+# pvalue for T2 (A vs H)
+pv_ah = ggplot(data = record, aes(x = qtlmarker, y = AHp)) +
+  geom_point(aes(size = AHp_b, color = AHp_b))+
+  geom_hline(yintercept=0.05, linetype="dashed", color = "#61A2DA", lwd = 1.25)+
+  scale_color_manual(values=c("#999999", "#D75725"), name = "Significant", labels = c("no","yes") )+
+  scale_size_manual(values=c(2,3),name = "Significant", labels = c("no","yes"))+
+  labs(title = "T2 (A vs H)", x = "QTLmarker", y = "p value") +
+  theme_light()+
+  theme(axis.text.x = element_text(angle = 270, vjust = 0.5, hjust=1))
+pv_ah
+
+
+# pvalue for T3 (B vs H)
+pv_bh = ggplot(data = record, aes(x = qtlmarker, y = BHp)) +
+  geom_point(aes(size = BHp_b, color = BHp_b))+
+  geom_hline(yintercept=0.05, linetype="dashed", color = "#61A2DA", lwd = 1.25)+
+  scale_color_manual(values=c("#999999", "#D75725"), name = "Significant", labels = c("no","yes") )+
+  scale_size_manual(values=c(2,3),name = "Significant", labels = c("no","yes"))+
+  labs(title = "T3 (B vs H)", x = "QTLmarker", y = "p value") +
+  theme_light()+
+  theme(axis.text.x = element_text(angle = 270, vjust = 0.5, hjust=1))
+pv_bh
+```
+
+## 4. Analysis: Network analysis for specific significant QTLmarkers
+
+### Analysis 
+
+In this section, we  further investigate the QTLmarkers with significant effect. For illustration, we consider the significant QTLmarker X20 with p value $= 0$ in $T_1$. 
+
+Now, we implement the $T_1$ sLED test for X20. This time, we choose a better sparsity level and permutation time for interpretation. I choose sparsity level $0.2$ and permutation time $100$. Better choices of these tuning parameters can be applied with more external knowledge. 
+
+```{r}
+
+markergeno <- qtlmarker$X20
+
+# Subdivide expression data by genotype
+tagseq_aa <- tagseq[markergeno == "A",]
+tagseq_bb <- tagseq[markergeno == "B",]
+
+# test
+sLED_ab = sLED(tagseq_aa, tagseq_bb, sumabs.seq = 0.2, npermute = 100, seeds = 1:100) # T1
+
+sLED_ab$pVal
+```
+
+According to [Zhu et al, 2017], top genes related to the network difference are identified with non-zero leverage. In our example, we have 5 top genes. 
+
+Note that the number of top genes is closely related to the sparsity level. A smaller sparsity level results to less top genes. 
+
+```{r}
+# top genes 
+colnames(tagseq_aa)[which(sLED_ab$leverage > 1e-6)]
+```
+
+
+### Visualization
+
+To confirm the test result, we visualize the expression networks when X20 is equal to "A" and "B". 
+
+We first obtain the expression networks by thresholding the correlation matrices. 
+
+
+```{r}
+# index of top genes
+top_genes = c(1:100)[which(sLED_ab$leverage > 1e-6)]
+
+###### Obtain expression network by truncating correlation matrices
+
+# correlation matrices
+N_a = abs(cor(tagseq_aa)) 
+N_b = abs(cor(tagseq_bb)) 
+
+# adjacency matrices 
+cutoff <- 0.7
+
+N_a[N_a >= cutoff] = 1
+N_a[! N_a >= cutoff] = 0
+
+N_b[N_b >= cutoff] = 1
+N_b[! N_b >= cutoff] = 0
+
+```
+
+We plot the networks **with edges only related to top genes** using package "igraph". We mark the top genes with red color.
+
+
+```{r}
+
+####### Visualize the expression network with X20 = "A" and "B"
+
+# prepare network files
+
+# get vertices
+gene = 1:100
+
+# get node-edge files
+
+# N_a
+network_a = NULL
+for (i in top_genes) {
+  for (j in 1:100) {
+    if( N_a[i,j]!=0 & i != j){
+      network_a = rbind(network_a, c(i, j, 1, 1))
+    }
+  }
+}
+colnames(network_a) = c("from","to","value","sign")
+network_a = as.data.frame(network_a)
+
+# N_b
+network_b = NULL
+for (i in top_genes) {
+  for (j in 1:100) {
+    if( N_b[i,j]!=0 & i != j){
+      network_b = rbind(network_b, c(i, j, 1, 1))
+    }
+  }
+}
+colnames(network_b) = c("from","to","value","sign")
+network_b = as.data.frame(network_b)
+
+
+# igraph settings
+width = 0.5
+edge_color = "#466CA6"
+vertex_color = rep("#999999", 100)
+vertex_color[top_genes] = "#D75725"
+
+# plot N_a 
+g_a = graph_from_data_frame(network_a, directed = F, vertices = gene)
+plot(g_a, layout = layout.circle(g_a),
+     edge.width = width,
+     edge.color = edge_color,
+     vertex.label= NA,
+     vertex.color = vertex_color,
+     vertex.size= 5,
+     vertex.frame.color = "black")
+
+
+# plot N_b
+g_b= graph_from_data_frame(network_b, directed = F, vertices = gene)
+plot(g_b, layout = layout.circle(g_b),
+     edge.width = width,
+     edge.color = edge_color,
+     vertex.label= NA,
+     vertex.color = vertex_color,
+     vertex.size= 5,
+     vertex.frame.color = "black")
+
+```
+
+
+
