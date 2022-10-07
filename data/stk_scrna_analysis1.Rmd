@@ -1,0 +1,267 @@
+---
+title: "Clustering analysis for stickleback scRNA data"
+output: html_document
+author: Jiaxin Hu
+date: '2022-04-29'
+---
+
+
+This file aims to replicate the cell clustering analysis in the Figure 1 of [Fuess and Bolnick (2021)](https://www.biorxiv.org/content/10.1101/2021.12.20.473470v1) using the single-cell RNA sequencing data in [Google Drive](https://drive.google.com/drive/folders/1GGowW7OZWa9y9Uu_OMwxsDbTL9In2d1P). Note that the original code and the specific clustering results in Fuess and Bolnick (2021) are not available. Following procedures lead to a different figure than the main Figure 1 in paper, though they may share similar biological interpretations.
+
+The analysis pipeline follows the [tutorial](https://satijalab.org/seurat/articles/pbmc3k_tutorial.html) for Seurat package. 
+
+
+##### 0. Load dependencies
+
+```{r warning=FALSE, message=FALSE, results=FALSE}
+# to check the installation errors, use ```{r}
+library(Seurat)
+library(dplyr)
+library(patchwork)
+library(ggplot2)
+library(viridis)
+
+# if you do not install the python package "umap-learn", run
+# reticulate::py_install(packages ='umap-learn')
+
+library(openxlsx)
+library(plot.matrix)
+library(RColorBrewer)
+
+```
+
+
+#### 1. Read data
+
+```{r}
+stk.data <- Read10X(data.dir = "./filtered_feature_bc_matrix/")
+stk <- CreateSeuratObject(counts = stk.data, project = "stk", min.cells = 3, min.features = 200)
+stk
+```
+
+#### 2. Pre-processing 
+
+**Quality control (QC) to select high-quality cells**
+
+Following the paper, we discard the cells that with (1) more than 35000 Unique Molecular Identifiers (UMIs, `nCount_RNA`), (2) fewer than 400 genes (`nFeature_RNA`), (3) more than 30\% mtDNA content (percentage of genes start with `mt`), and (4) more than 1000 hemoglobin transcripts (percentage of genes start with `hb`) from the downstream analysis. 
+
+***Note that I am not sure whether the selections for mtDNA and hemoglobin transcripts are valid for teleosts. I find current selection criteria in the human genetics research.***
+
+```{r}
+# mtDNA
+stk[["percent.mt"]] <- PercentageFeatureSet(stk, pattern = "^mt-")
+
+# hemoglobin transcript
+stk[["percent.hb"]] <- PercentageFeatureSet(stk, pattern = "^hb[^(p)]")
+
+# selection
+stk <- subset(stk, subset = nCount_RNA <= 35000 & nFeature_RNA >= 400 & percent.mt <= 30 &  percent.hb <= 100000/dim(stk.data)[1])
+stk
+```
+
+**Normalization by log transformation**
+
+```{r}
+### Normalization
+stk <- NormalizeData(stk, normalization.method = "LogNormalize", scale.factor = 10000)
+```
+
+**Selecting high variable genes by dispersion**
+```{r}
+### Selecting high variable genes by dispersion
+stk <- FindVariableFeatures(stk, selection.method = "disp", nfeatures = 4000)
+stk
+```
+
+**Scaling to standardize the expression**
+
+```{r}
+### Scaling
+all.genes <- rownames(stk)
+stk <- ScaleData(stk, features = all.genes)
+```
+
+#### 3. Linear dimensional reduction: PCA
+
+**Run PCA**
+
+```{r}
+# run PCA
+stk <- RunPCA(stk, features = VariableFeatures(object = stk))
+
+```
+
+**Determine the dimensionality**
+
+```{r}
+# determine dimension
+ElbowPlot(stk)
+```
+
+Checking the variance explained by PCs, we choose the first 15 PCs for following analyses. 
+```{r}
+d = 15
+```
+
+#### 4. Clustering
+
+**Original clustering**
+We find the clustering with 15 PCs to generate a neighborhood graph with using 25-nearest-neighbors. Then, we apply Louvain algorithm (Leiden algorithm leads to many installation issues here) to the neighborhood graph to find the clustering. 
+
+```{r}
+stk <- FindNeighbors(stk, dims = 1:d, k.param = 25)
+stk <- FindClusters(stk, resolution = 0.4) # Louvain algorithm
+cluster_stk = Idents(stk)
+```
+
+The algorithm results in 23 cluster groups. Following is the UMAP for the cells labeled by these 23 group assignment.
+```{r}
+stk <- RunUMAP(stk, dims = 1:d, umap.method = "umap-learn")
+DimPlot(stk, reduction = "umap", label = TRUE)
+```
+
+
+**Condensed clustering**
+
+We then condense the 23 clusters to 8 clusters as Fuess and Bolnick (2021). We compare the top marker genes in our 23 clusters versus the top marker genes in Lauren's 8 clusters (Supplement Table 1). 
+
+```{r}
+# find distinguishing genes for 23 clusters
+stk.markers <- FindAllMarkers(stk, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+
+top_genes = stk.markers %>%
+    group_by(cluster) %>%
+    slice_max(n = 10, order_by = avg_log2FC)
+
+# compared with Lauren's top genes
+top_genes_L = read.xlsx("top_gene_L.xlsx")
+
+top_genes$gene = gsub("(.)\\..", replacement = "\\1" ,top_genes$gene)
+top_genes$gene = gsub("(ENSGACG\\d{10})\\d", replacement = "\\1" ,top_genes$gene)
+
+cluster_name = top_genes_L$cluster
+gene_count = c()
+for (i in 1:length(cluster_name)) {
+
+  reference = unique(strsplit(top_genes_L[i,2], "; ")[[1]])
+  top_count = c()
+  for (j in 1:length(levels(top_genes$cluster))) {
+    top_count = c(top_count, sum(top_genes[top_genes$cluster == levels(top_genes$cluster)[j],]$gene %in% reference))
+  }
+  
+  gene_count = rbind(gene_count, top_count)
+}
+rownames(gene_count) = cluster_name
+colnames(gene_count) = 0:22
+
+gene_count[which(gene_count == 0, arr.ind = T)] = NA
+
+plot(gene_count, col = brewer.pal(9, "Blues"),axis.row = list(side=2, las=1, cex.axis=0.7),
+     xlab="clusters", ylab=" ", main = "Top genes counts")
+```
+
+We assign the 23 clusters to 8 clusters according to the top gene counts. 
+
+```{r}
+neu = c(0,1,7, 14, 3, 6, 8)
+apc = c(4, 15, 16)
+bcell = c(2, 5,13)
+pl = c(21)
+fi = c(22)
+nkc = c(20)
+ery = c(18,19)
+hc = c(9, 10, 11,12, 17)
+
+id = as.character(0:22)
+new.cluster.ids <- rep(NA, length(id))
+new.cluster.ids[id %in% neu] = "Neutrophils"
+new.cluster.ids[id %in% apc] = "APC"
+new.cluster.ids[id %in% bcell] = "B_cells"
+new.cluster.ids[id %in% pl] = "Platelets"
+new.cluster.ids[id %in% fi] = "Fibroblasts"
+new.cluster.ids[id %in% nkc] = "NKC"
+new.cluster.ids[id %in% ery] = "Erythrocytes"
+new.cluster.ids[id %in% hc] = "HC"
+names(new.cluster.ids) = levels(stk)
+
+stk <- RenameIdents(stk, new.cluster.ids)
+DimPlot(stk, reduction = "umap", label = TRUE)
+```
+
+Last, we plot the gene-cell expression heatmap with top 5 genes in each cluster and 50 randomly chosen cells in each cell type based on the condensed clustering result.
+
+```{r}
+# find distinguishing genes
+stk.markers <- FindAllMarkers(stk, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+
+# top genes
+stk.markers %>%
+  group_by(cluster) %>%
+  top_n(n = 10, wt = avg_log2FC) -> top10
+
+top10$gene = gsub("(.)\\..", replacement = "\\1" ,top10$gene)
+top10$gene = gsub("(ENSGACG\\d{10})\\d", replacement = "\\1" ,top10$gene)
+
+
+# compare with Lauren's top genes
+cluster_name = top_genes_L$cluster
+cluster_name_top10 = cluster_name
+cluster_name_top10[cluster_name_top10 =="Bcell "] = "B_cells"
+cluster_name_top10[cluster_name_top10 =="platelets"] = "Platelets"
+gene_count = c()
+for (i in 1:length(cluster_name)) {
+
+  reference = unique(strsplit(top_genes_L[i,2], "; ")[[1]])
+  top_count = c()
+  for (j in 1:length(cluster_name)) {
+    top_count = c(top_count, sum(top10[top10$cluster == cluster_name_top10[j],]$gene %in% reference))
+  }
+  gene_count = rbind(gene_count, top_count)
+}
+rownames(gene_count) = cluster_name
+colnames(gene_count) = cluster_name
+
+gene_count[which(gene_count == 0, arr.ind = T)] = NA
+
+plot(gene_count, col = brewer.pal(9, "Blues"),axis.row = list(side=2, las=1, cex.axis=0.7), axis.col = list( cex.axis=0.7), xlab="our clusters", ylab=" ", main = "Top genes counts")
+```
+
+```{r}
+# display re-discovered genes
+
+for (i in 1:length(cluster_name)) {
+
+  reference = unique(strsplit(top_genes_L[i,2], "; ")[[1]])
+  redisc = intersect(top10[top10$cluster == cluster_name_top10[i],]$gene, reference) 
+  
+  cat("Rediscovered genes in cell type ", cluster_name[i], ": \n", redisc, "\n")
+}
+
+# top genes
+stk.markers0 =  stk.markers[-grep("ENSGACG\\d+", stk.markers$gene), ]
+stk.markers0 %>%
+  group_by(cluster) %>%
+  top_n(n = 5, wt = avg_log2FC) -> top5
+
+for (i in 1:length(cluster_name)) {
+  newdisc = top5[top5$cluster == cluster_name_top10[i],]$gene
+  cat("Top 5 marker genes in cell type",cluster_name[i], ": \n", newdisc, "\n")
+}
+
+```
+
+
+
+
+```{r}
+
+# random select 50 cells for each type
+cluster_stk = data.frame(cell =  colnames(stk[["RNA"]]), cluster = Idents(stk))
+cluster_stk %>%
+  group_by(cluster) %>%
+  slice_sample(n = 50) -> random_cell
+
+# heatmap
+DoHeatmap(stk, features = top5$gene, cells = random_cell$cell, raster = FALSE) + scale_fill_viridis()
+```
+

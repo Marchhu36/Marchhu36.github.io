@@ -1,0 +1,280 @@
+---
+title: "Q&A-style analysis for stickleback scRNA data"
+output: html_document
+author: Jiaxin Hu
+date: '2022-04-17'
+---
+
+This file does the Q&A-style analysis for the stickleback single-cell RNA sequencing (scRNA) data in [Google Drive](https://drive.google.com/drive/folders/1GGowW7OZWa9y9Uu_OMwxsDbTL9In2d1P). 
+
+#### Questions
+
+As far as I am concerned, the ultimate goal of Dan's project is to discover the potential factors (e.g. genotype, environment, celltype) that have significant effects to the gene-gene (GxG) network in stickleback. Note that we do not have genotype and environment information with current data. Therefore, following questions focus on the general and celltype-specified GxG network.
+
+- General GxG network:
+  - Q1: How to efficiently reconstruct the general GxG network from scRNA data? Are there any community structures for the general GxG network? 
+  
+- Celltype-specified GxG network:
+  - Q2: How to reconstruct the GxG network for each celltype? Are there any community structures for the GxG networks in each celltype?
+  - Q3: Are there any significant network differences among the celltypes? 
+  - Q4: Are there any significant community differences among different celltype-specified networks?
+  
+***In this file, I answered the questions Q1, Q2 and Q3 with quick-and-dirty methods using R package `WGCNA` and `sLED`. We mainly follow the [WGCNA Tutorial](https://horvath.genetics.ucla.edu/html/CoexpressionNetwork/Rpackages/WGCNA/Tutorials/) for the network analysis.***
+  
+### 0. Preliminary 
+
+#### 0.1 Load dependencies
+
+```{r warning=FALSE, message=FALSE, results=FALSE}
+
+library(WGCNA)
+options(stringsAsFactors = FALSE);
+
+# install.packages("devtools") ## if not installed
+# library("devtools")
+# devtools::install_github("lingxuez/sLED")
+library(sLED)
+
+library(RColorBrewer)
+```
+
+#### 0.2 Read pre-processed data
+
+Due to the huge dimension of the scRNA data, we consider a subset of stickleback scRNA data based on the preliminary celltype clustering analysis. We use the function `FindVariableFeatures()` in `Seurat` and select 500 high variable genes with large dispersion. We also randomly sample 2% cells from 8 celltypes. The reduced dataset involves the expressions of 500 genes in 1075 cells and the celltype labels for each cell. 
+
+```{r}
+# read data
+load("stk_red.RData")
+
+stk_red = as.data.frame(t(stk_red_df))
+rownames(stk_red) =  gsub("\\.", "-", rownames(stk_red))
+rm(stk_red_df)
+
+dim(stk_red)
+```
+
+Following the tutorial of WGCNA, we exclude 108 genes with excessive 0 expressions. 
+```{r}
+# delete bad samples and genes in the dataset
+gsg = goodSamplesGenes(stk_red, verbose = 3);
+gsg$allOK
+
+if (!gsg$allOK)
+{
+  # Optionally, print the gene and sample names that were removed:
+  if (sum(!gsg$goodGenes)>0) 
+    printFlush(paste("Removing genes:", paste(names(stk_red)[!gsg$goodGenes], collapse = ", ")));
+  if (sum(!gsg$goodSamples)>0) 
+    printFlush(paste("Removing samples:", paste(rownames(stk_red)[!gsg$goodSamples], collapse = ", ")));
+  # Remove the offending genes and samples from the data:
+  stk_red = stk_red[gsg$goodSamples, gsg$goodGenes]
+}
+dim(stk_red)
+```
+
+No more than 30 cells come from celltype c6, c7, and c8, which may lead to an unstable result.  We merge celltypes c6, c7, and c8 for a more robust analysis.
+```{r}
+table(random_cell$cluster)
+# merged c6, c7, c8 
+random_cell$cluster[random_cell$cluster == "c7"|random_cell$cluster == "c8"] = "c6"
+```
+
+### Q1: General network reconstruction and community detection
+
+#### 1.1 Network reconstruction using topological overlap matrix
+
+Following WCGNA tutorial, we reconstruct the GxG network using the topological overlap matrix (TOM) of the soft-thresholding adjacency matrix. Specifically, the soft-thresholding adjacency matrix $A$ has entries
+$$A_{ij} = |\text{Cor}(\text{Gene}_i, \text{Gene}_j)|^{\beta},$$
+where $\text{Gene}_i$ is the $i$-th gene expression across the cells, and $\beta$ is the soft-thresholding parameter that can be automatically determined by the function ` pickSoftThreshold()`. With given $A$, we generate the TOM $\Omega$ using `TOMsimilarity()`. A larger $\Omega_{ij}$ indicates a higher similarity between gene $i$ and gene $j$. See the reference [Zhang and Horvath, 2005](https://dibernardo.tigem.it/files/papers/2008/zhangbin-statappsgeneticsmolbio.pdf) for details. 
+
+We take TOM as the weighted GxG network. 
+
+```{r}
+# select the soft-thresholding parameter
+powers = c(c(1:10), seq(from = 12, to=20, by=2))
+sft = pickSoftThreshold(stk_red, powerVector = powers, verbose = 5)
+softPower = which.max(-sign(sft$fitIndices[,3])*sft$fitIndices[,2])
+
+# generate soft-thresholding adjacency matrix
+adjacency = adjacency(stk_red, power = softPower);
+
+# transfer to TOM
+TOM = TOMsimilarity(adjacency)
+# dissimilarity
+dissTOM = 1-TOM
+```
+
+#### 1.2 Community detection 
+
+We use the hierarchical clustering based on the TOM dissimilarity ($1 - \Omega$) to produce a hierarchical clustering tree of genes. Then, we merge the clusters whose expression profiles are very similar using `mergeCloseModules()` .
+
+
+```{r}
+
+geneTree = hclust(as.dist(dissTOM), method = "average")
+
+minModuleSize = 10;
+# Module identification using dynamic tree cut:
+dynamicMods = cutreeDynamic(dendro = geneTree, distM = dissTOM,
+                            deepSplit = 2, pamRespectsDendro = FALSE,
+                            minClusterSize = minModuleSize)
+dynamicColors = labels2colors(dynamicMods)
+
+# merge the modules
+merge = mergeCloseModules(stk_red, dynamicColors, verbose = 3)
+mergedColors = merge$colors
+
+table(mergedColors)
+```
+
+#### 1.3 Visualization
+
+We plot the general GxG network using heatmap with gene cluster labels. For a better visualization, we do the log transformation of the TOM and reorder the genes based on the clustering assignment. The color bar indicates the cluster labels for each gene.
+
+```{r}
+plotTOM = TOM*(10^8);
+# Set diagonal to NA for a nicer plot
+diag(plotTOM) = NA;
+
+gene_order = order(dynamicMods)
+#pdf("general_network.pdf", height = 8, width = 8)
+heatmap(log(plotTOM[gene_order, gene_order]), 
+        ColSideColors = dynamicColors[gene_order],
+        RowSideColors= dynamicColors[gene_order], 
+        main = paste0("General Network"),Colv=NA, Rowv=NA, scale="none")
+#dev.off()
+
+```
+
+The heatmap indicates there exists a significant block structure in the TOM with 392 genes. 
+
+### Q2: Cell-type network reconstruction and community detection
+
+We repeat the network reconstruction and community detection with the expression data for each celltype. Note that for each celltype, there are some genes keep 0 expression across the cells, which will return `NA` in the TOM and be reflected as the blank space in the heatmap of TOM.   
+
+```{r  message=FALSE, results=FALSE}
+TOM_list = list()
+plotTOM_list = list()
+geneTree_list = list()
+dynamicColors_list = list()
+
+cell_type_name = c("c1", "c2","c3","c4","c5","c6")
+
+for (i in 1:length(cell_type_name)) {
+  cat("cell type = ", i, "\n")
+  
+  c_cell = random_cell$cell[random_cell$cluster == cell_type_name[i]]
+  stk_c = stk_red[rownames(stk_red) %in% c_cell, ]
+  
+  powers = c(c(1:10), seq(from = 12, to=20, by=2))
+  sft = pickSoftThreshold(stk_c, powerVector = powers, verbose = 5)
+  softPower = which.max(-sign(sft$fitIndices[,3])*sft$fitIndices[,2])
+
+  # generate soft-thresholding adjacency matrix
+  adjacency = adjacency(stk_c, power = softPower);
+
+  # transfer to TOM
+  TOM = TOMsimilarity(adjacency)
+  TOM_list[[i]] = TOM
+  
+  plotTOM = TOM*(10^8);
+  # Set diagonal to NA for a nicer plot
+  diag(plotTOM) = NA;
+  plotTOM_list[[i]] = plotTOM
+  
+  # dissimilarity
+  dissTOM = 1-TOM
+
+  geneTree = hclust(as.dist(dissTOM), method = "average")
+  geneTree_list[[i]] = geneTree
+  
+  minModuleSize = 20;
+  # Module identification using dynamic tree cut:
+  dynamicMods = cutreeDynamic(dendro = geneTree, distM = dissTOM,
+                              deepSplit = 2, pamRespectsDendro = FALSE,
+                              minClusterSize = minModuleSize)
+  dynamicColors = labels2colors(dynamicMods)
+  dynamicColors_list[[i]] = dynamicColors
+}
+```
+
+We visualize the networks and communities for each celltype. The order of genes are the same as the general network. 
+
+```{r}
+#pdf(file = "c_network.pdf", height = 8, width = 8)
+for (i in 1:length(cell_type_name)) {
+  heatmap(log(plotTOM_list[[i]][gene_order,gene_order]),
+          ColSideColors = dynamicColors_list[[i]][gene_order],
+          RowSideColors= dynamicColors_list[[i]][gene_order], 
+          main = paste0("Network Heatmap for Cell type ", cell_type_name[[i]]),
+          Colv=NA, Rowv=NA, scale = "none")
+
+}
+#dev.off()
+```
+
+In general, the community structures of each celltype are not super clear when the gene follows the same order of general network. The heatmap for the celltype c6 (merged with c7 and c8) shows a significantly different pattern than other celltypes. The celltype c6 shows strong connections among the genes that rarely expressed in other celltypes. Though other 5 celltypes show the similar pattern of the blank space, there exist network connection differences among the expressed gene. We will take a closer look in the next section. 
+
+### Q3: Cell-type network difference testing
+
+We check the differences among the celltype networks by visualizing the differential TOM networks and the covariance-based hypothesis testing in [Zhu et.al](https://arxiv.org/abs/1606.00252).
+
+#### 3.1 Visualizing differential TOM networks
+
+Checking the network heatmaps for 6 celltypes, the heatmaps of type c1, c2, c4 are most similar with each other. We plot the centralized differential TOM matrices; i.e., $\tilde D = D -  \bar D, D = \Omega_i - \Omega_j$, $\Omega_i$ is the TOM of celltype $i$, and $\bar D$ is the mean value of all the entries in $D$. Blue indicates the negative entry and red indicates the positive entry.
+
+```{r}
+# c1 vs c2
+d12 = (plotTOM_list[[1]][gene_order,gene_order]- plotTOM_list[[2]][gene_order,gene_order] )*(10^(-5))
+heatmap(d12 - mean(d12,na.rm = T),
+          main = paste0("Differential network of ", cell_type_name[[1]], " and ", cell_type_name[[2]]),
+          Colv=NA, Rowv=NA, scale = "none", col = colorRampPalette(brewer.pal(10, "RdBu"))(7))
+
+# c1 vs c4
+d14 = (plotTOM_list[[1]][gene_order,gene_order]- plotTOM_list[[4]][gene_order,gene_order] )*(10^(-5))
+heatmap(d14 - mean(d14,na.rm = T),
+          main = paste0("Differential network of ", cell_type_name[[1]], " and ", cell_type_name[[4]]),
+          Colv=NA, Rowv=NA, scale = "none", col = colorRampPalette(brewer.pal(10, "RdBu"))(7))
+
+# c2 vs c4
+d24 = (plotTOM_list[[2]][gene_order,gene_order]- plotTOM_list[[4]][gene_order,gene_order] )*(10^(-5))
+heatmap(d24 - mean(d24,na.rm = T),
+          main = paste0("Differential network of ", cell_type_name[[2]], " and ", cell_type_name[[4]]),
+          Colv=NA, Rowv=NA, scale = "none", col = colorRampPalette(brewer.pal(10, "RdBu"))(7))
+
+```
+
+
+The differential plots indicate that there exist network differences among celltypes c1, c2, and c4.
+
+
+#### 3.2 Covariance-based hypothesis testing
+
+We apply the pairwise test for high-dimensional covariance matrices for all the pairs $(i,j),\  i,j, \in \{ \text{c1, c2, c3, c4, c5, c6} \}.$ 
+
+```{r}
+
+stk_c_list = list()
+for (i in  1:length(cell_type_name)) {
+  c_cell = random_cell$cell[random_cell$cluster == cell_type_name[i]]
+  stk_c_list[[i]] = stk_red[rownames(stk_red) %in% c_cell, ]
+}
+
+for (i in 1:(length(cell_type_name)-1) ){
+  for (j in (i+1):length(cell_type_name)) {
+    cat("Compare cell type", cell_type_name[i], " and ", cell_type_name[j],
+        " : p value = ", sLED(stk_c_list[[2]], stk_c_list[[3]])$pVal, "\n" )
+  }
+}
+```
+
+We have 0 p-values for all the pairwise tests. This indicates that there are significant difference among the gene expression covariance matrices for each celltype. Note that TOM is also generated from the covariance matrix. We can believe there also exist significant differences among the TOMs for each celltype.
+
+### Discussion
+
+- Though there exists a clear community structure in the general GxG network, we can not use the celltype-specified network to explain the community structure very well. Specifically, celltypes c1 - c5 all show strong connections among the genes in the middle part (labeled as light blue in the general network). We may further focus on that subset of genes in the future analysis. 
+
+- The celltype-specified networks do not show a straightforward differences among celltypes c1 - c5. Though covariance-based testing supports the existence of differences, the Gaussian assumption may not be true for the scRNA data and the TOM network is not exactly equal to the covariance matrix. Therefore, we may find another test or method to directly and statistically check the differences among TOM networks. 
+
+- We do not check the community differences among the celltypes. Need to find a test or method for the community testing. 
+
